@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 import subprocess
+import time
 from compression import zstd
 from pathlib import Path
 
@@ -18,6 +19,11 @@ SKIP = {".git", ".hg", ".svn", ".codex", ".ssh", ".aws", ".venv", "venv", "node_
         "dist", "build", "target", ".ds_store", "thumbs.db", ".npmrc", ".pypirc", ".netrc",
         "auth.json", "credentials.json", "secrets.json", "id_rsa", "id_ed25519"}
 FILE_LIMIT = 100_000
+MIB = 1024 ** 2
+
+
+class SyncCancelled(Exception):
+    pass
 
 
 def allowed(relative):
@@ -41,11 +47,11 @@ def project_desc(value):
     return title, count
 
 
-def fingerprint(path, known=None):
+def fingerprint(path, known=None, progress=None):
     s = stamp(path)
     if known and s == known[0]:
         return known
-    h = hash_file(path)
+    h = hash_file(path, progress)
     if stamp(path) != s:
         raise SyncError(f"Changed while reading {path.name}; will retry.")
     return [s, h]
@@ -186,15 +192,30 @@ class Engine:
                         chat.project = shared
         return projects, chats, selections, setup
 
-    def run(self, folder, edits=None, report=lambda message: None):
+    def run(self, folder, edits=None, report=lambda message: None, *, cancelled=lambda: False):
+        def check_cancel():
+            if cancelled():
+                raise SyncCancelled
+
+        last_report = 0.0
+
+        def progress(message, *, force=False):
+            nonlocal last_report
+            check_cancel()
+            now = time.monotonic()
+            if force or now - last_report >= 0.4:
+                report(message)
+                last_report = now
+
+        progress("Reading Drive selections…", force=True)
         exchange = Exchange(folder, create=bool(edits))
         state_path = self.local_dir / f"{exchange.id}.json"
         state = read_json(state_path, {"chats": {}, "workspaces": {}, "project_map": {}})
         if edits:
             exchange.update_selections(edits)
         selected = exchange.selections()
+        progress("Reading the local chat list…", force=True)
         projects, chats = catalog(self.home)
-        report(f"Checking {len(selected)} selections…")
         stats = {"sent": 0, "received": 0, "waiting": 0, "issues": []}
 
         def save():
@@ -219,6 +240,7 @@ class Engine:
         local_to_shared = {}
         pending_projects = {}
         for key, desc in selected.items():
+            check_cancel()
             if desc["kind"] != "project":
                 continue
             try:
@@ -227,8 +249,6 @@ class Engine:
                 local_to_shared[p.id] = key
                 if p.id not in projects:
                     pending_projects[key] = p
-                if desc.get("files") is True:
-                    self.sync_files(exchange, key, p, state["workspaces"].setdefault(key, {}), stats)
             except (OSError, ValueError, SyncError, subprocess.SubprocessError) as exc:
                 note(desc.get("title", key), exc)
 
@@ -239,9 +259,12 @@ class Engine:
             path = exchange.root / "members" / key
             all_ids.update(p.stem for p in path.glob("*.json") if ID.fullmatch(p.stem))
         incoming = []
-        for ident in sorted(all_ids):
+        if all_ids:
+            progress(f"Checking {len(all_ids):,} chats…", force=True)
+        for number, ident in enumerate(sorted(all_ids), 1):
             chat = chats.get(ident)
             explicit = selected.get(ident, {}).get("kind") == "chat"
+            progress(f"Checking chat {number:,} of {len(all_ids):,}…")
             try:
                 key = "c-" + hashlib.sha256(ident.encode()).hexdigest()
                 record = state["chats"].setdefault(ident, {})
@@ -279,7 +302,11 @@ class Engine:
                 if remote_changed or (remote and not local and not base):
                     incoming.append((ident, chat, record, heads[0], remote, False))
                 elif changed:
-                    exchange.push(chat.path, file[1], file[0])
+                    def chat_progress(copied, total):
+                        progress(f"Sending chat {number:,} of {len(all_ids):,} · "
+                                 f"{copied / MIB:.1f} of {total / MIB:.1f} MiB")
+
+                    exchange.push(chat.path, file[1], file[0], chat_progress)
                     rev = exchange.publish(key, heads, local)
                     record.update(revision=rev, signature=chat_signature(local, file))
                     stats["sent"] += 1
@@ -288,11 +315,17 @@ class Engine:
         save()
 
         if incoming or pending_projects:
-            if codex_open():
-                stats["waiting"] = len(incoming) + len(pending_projects)
-            else:
-                self.home.mkdir(parents=True, exist_ok=True)
-                server = AppServer(self.home)
+            progress("Preparing incoming chats and projects…", force=True)
+            server = None
+            try:
+                if codex_open():
+                    stats["waiting"] = len(incoming) + len(pending_projects)
+                else:
+                    self.home.mkdir(parents=True, exist_ok=True)
+                    server = AppServer(self.home)
+            except (OSError, SyncError, subprocess.SubprocessError) as exc:
+                note("Codex", exc)
+            if server is not None:
                 try:
                     def register(key, project, threads=()):
                         mapping = state["project_map"].setdefault(key, {})
@@ -319,11 +352,13 @@ class Engine:
                         save()
 
                     for key, p in pending_projects.items():
+                        progress(f"Restoring project {p.title}…")
                         try:
                             register(key, p)
                         except (OSError, ValueError, SyncError) as exc:
                             note(p.title, exc)
-                    for ident, chat, record, rev, data, resume in incoming:
+                    for number, (ident, chat, record, rev, data, resume) in enumerate(incoming, 1):
+                        progress(f"Restoring chat {number:,} of {len(incoming):,}…")
                         try:
                             pid = data.get("project")
                             p = project_for(checked(pid), data["project_info"]) if pid else None
@@ -363,7 +398,16 @@ class Engine:
                             note(str(data.get("title", ident)), exc)
                 finally:
                     server.close()
-        save()
+
+        # Large workspaces must not hold up the project and chat metadata.
+        for key, project in selected_projects.items():
+            if selected[key].get("files") is True:
+                try:
+                    self.sync_files(exchange, key, project, state["workspaces"].setdefault(key, {}),
+                                    stats, progress)
+                    save()
+                except (OSError, ValueError, SyncError, subprocess.SubprocessError) as exc:
+                    note(project.title, exc)
         return stats
 
     def install_chat(self, exchange, ident, chat, data, record, rev, root, save, resume):
@@ -413,7 +457,8 @@ class Engine:
             record.update(pending=rev, pending_file=hash_file(dest))
             save()
 
-    def sync_files(self, exchange, ident, project, state, stats):
+    def sync_files(self, exchange, ident, project, state, stats, progress):
+        progress(f"Scanning project files for {project.title}…", force=True)
         if any(linklike(Path(r)) for r in project.roots):
             raise SyncError("A project workspace is a link; choose a regular folder.")
         roots = tuple(Path(r).resolve() for r in project.roots)
@@ -435,14 +480,20 @@ class Engine:
                 rel = f"{i}/{name}"
                 if len(local) >= FILE_LIMIT:
                     raise SyncError("Workspace exceeds the 100,000 file limit.")
-                cache[rel] = fingerprint(path, state.get("cache", {}).get(rel))
+                scanning = f"Scanning {project.title} · {len(local):,} files checked"
+                progress(scanning)
+                cache[rel] = fingerprint(path, state.get("cache", {}).get(rel),
+                                         lambda count: progress(f"{scanning} · {count / MIB:.0f} MiB read"))
                 local[rel] = cache[rel][1]
                 destinations[rel] = path
         merged = dict(remote)
         downloads = {}
         conflicts = []
         seen = set()
-        for rel in sorted(set(local) | set(remote)):
+        paths = sorted(local.keys() | remote.keys())
+        progress(f"Comparing {len(paths):,} project files for {project.title}…", force=True)
+        for number, rel in enumerate(paths, 1):
+            progress(f"Comparing {project.title} · {number:,} of {len(paths):,} files")
             index, _, path = rel.partition("/")
             folded = rel.casefold()
             if folded in seen:
@@ -464,17 +515,24 @@ class Engine:
                 downloads[rel] = (dst, there)
         if conflicts:
             raise SyncError("Files changed on both computers: " + ", ".join(conflicts[:5]))
-        for rel, sha in merged.items():
-            if remote.get(rel) != sha:
-                exchange.push(destinations[rel], sha, cache[rel][0])
-        for rel, (dst, sha) in downloads.items():
+        uploads = [(rel, sha) for rel, sha in merged.items() if remote.get(rel) != sha]
+        for number, (rel, sha) in enumerate(uploads, 1):
+            label = f"Sending {project.title} · file {number:,} of {len(uploads):,}"
+            progress(label, force=number == 1)
+            exchange.push(destinations[rel], sha, cache[rel][0], lambda copied, total: progress(
+                f"{label} · {copied / MIB:.1f} of {total / MIB:.1f} MiB"))
+        for number, (rel, (dst, sha)) in enumerate(downloads.items(), 1):
+            label = f"Receiving {project.title} · file {number:,} of {len(downloads):,}"
+            progress(label, force=number == 1)
             with temporary(dst.parent) as tmp:
-                exchange.pull(sha, tmp)
+                exchange.pull(sha, tmp, lambda copied, total: progress(
+                    f"{label} · {copied / MIB:.1f} of {total / MIB:.1f} MiB"))
                 if (dst.exists() and rel not in cache) or (rel in cache and stamp(dst) != cache[rel][0]):
                     raise SyncError(f"{dst.name} changed during sync; will retry.")
                 os.replace(tmp, dst)
             cache[rel] = [stamp(dst), sha]
         if merged != remote or join_heads:
+            progress(f"Saving the file list for {project.title}…", force=True)
             rev = exchange.publish(key, heads, {"files": merged})
             stats["sent"] += 1
         else:

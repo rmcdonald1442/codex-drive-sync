@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -10,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from engine import Engine, project_info, workspace_versions
+from engine import Engine, SyncCancelled, project_info, workspace_versions
 from native import AppServer, catalog, executable, remap
 from storage import Exchange, SyncError, safe_path, write_json
 
@@ -107,6 +108,31 @@ class SyncTest(unittest.TestCase):
             self.assertIn("Files changed on both computers", result["issues"][0])
             self.assertEqual(target.read_text(), "b")
             self.assertEqual(source.read_text(), "a")
+
+    def test_stopping_a_workspace_transfer_keeps_chats_and_allows_retry(self):
+        ident, _ = make_chat(self.a.home, self.workspace)
+        content = b"workspace payload" * 100_000
+        (self.workspace / "large.txt").write_bytes(content)
+        messages = []
+
+        def cancelled():
+            return any(message.startswith("Sending Demo") for message in messages)
+
+        with self.assertRaises(SyncCancelled):
+            self.a.run(self.drive, self.choose(), messages.append, cancelled=cancelled)
+        exchange = Exchange(self.drive)
+        chat_key = "c-" + hashlib.sha256(ident.encode()).hexdigest()
+        workspace_key = "w-" + hashlib.sha256(self.pid.encode()).hexdigest()
+        obj = exchange.object_path(hashlib.sha256(content).hexdigest())
+        self.assertTrue(exchange.history(chat_key)[1])
+        self.assertEqual(exchange.history(workspace_key)[1], [])
+        self.assertFalse(obj.exists())
+        self.assertEqual(list(obj.parent.glob("*.tmp")), [])
+        self.assertTrue(any(message.startswith("Scanning project files") for message in messages))
+        retried = self.a.run(self.drive)
+        self.assertEqual(retried["issues"], [])
+        self.assertEqual(retried["sent"], 1)
+        self.assertEqual(obj.read_bytes(), content)
 
     def test_workspace_path_rejects_traversal_and_windows_devices(self):
         for rel in ("../escape", "nested/../escape", "/absolute", "C:/dir", "x/AUX.txt", "x/name."):

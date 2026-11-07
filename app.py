@@ -5,6 +5,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -12,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 if sys.version_info < (3, 14):
     raise SystemExit("Install Python 3.14 or newer with Tk to run Codex Drive Sync.")
 
-from engine import INTERVAL, Engine, project_info
+from engine import INTERVAL, Engine, SyncCancelled, project_info
 from storage import MARKER, read_json, write_json
 
 BG, PANEL, INK, MUTED, BLUE = "#111723", "#192233", "#edf3fc", "#a2b1c7", "#69b1ff"
@@ -59,6 +60,9 @@ class App:
         self.ready = False
         self.busy = False
         self.closing = False
+        self.cancel_event = None
+        self.phase = ""
+        self.started_at = 0.0
         self.messages = queue.Queue()
         self.status = tk.StringVar(value="Reading local Codex history…")
         self.caption = tk.StringVar(value="Local Codex projects and chats")
@@ -113,7 +117,7 @@ class App:
         footer.pack(side="bottom", fill="x", pady=(9, 0))
         self.refresh_button = ttk.Button(footer, text="Refresh list", command=lambda: self.start(sync=False))
         self.refresh_button.pack(side="left")
-        self.sync_button = ttk.Button(footer, text="Sync now", command=lambda: self.start(sync=True))
+        self.sync_button = ttk.Button(footer, text="Sync now", width=11, command=self.sync_action)
         self.sync_button.pack(side="right")
         self.apply_button = ttk.Button(footer, text="Apply selections", style="Primary.TButton", command=self.apply)
         self.apply_button.pack(side="right", padx=8)
@@ -242,7 +246,9 @@ class App:
         idle = self.ready and not self.busy and not self.closing
         for button in (self.browse_button, self.workspace_button, self.refresh_button):
             button.configure(state="normal" if idle else "disabled")
-        self.sync_button.configure(state="normal" if idle and self.setup else "disabled")
+        can_stop = self.cancel_event is not None and not self.cancel_event.is_set()
+        self.sync_button.configure(text="Stop sync" if self.cancel_event is not None else "Sync now",
+                                   state="normal" if can_stop or (idle and self.setup) else "disabled")
         self.apply_button.configure(state="normal" if idle and self.folder and self.edits else "disabled")
         self.details_button.configure(state="normal" if self.issues else "disabled")
         self.update_row_controls()
@@ -336,6 +342,15 @@ class App:
         if self.folder and self.edits:
             self.start(sync=True, edits=self.edits.copy())
 
+    def sync_action(self):
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+            self.phase = "Stopping after the current operation…"
+            self.status.set(self.phase)
+            self.update_controls()
+        else:
+            self.start(sync=True)
+
     def tick(self):
         if not self.closing:
             if self.folder and not self.busy:
@@ -346,32 +361,43 @@ class App:
         if self.busy or self.closing:
             return
         self.busy = True
-        self.status.set("Checking Drive and local history…" if sync else "Reading local projects and chats…")
+        cancel = threading.Event() if sync else None
+        self.cancel_event = cancel
+        self.phase = "Checking Drive and local history…" if sync else "Reading local projects and chats…"
+        self.started_at = time.monotonic()
+        self.status.set(self.phase)
         self.update_controls()
         folder, engine = self.folder, self.engine
         def work():
             stats, error = None, None
+            stopped = False
             if sync:
                 try:
-                    stats = engine.run(folder, edits, lambda message: self.messages.put(("status", message)))
+                    stats = engine.run(folder, edits, lambda message: self.messages.put(("status", message)),
+                                       cancelled=cancel.is_set)
+                except SyncCancelled:
+                    stopped = True
                 except Exception as exc:
                     error = str(exc)
+            self.messages.put(("status", "Refreshing the list…"))
             try:
                 result = engine.inspect(folder)
             except Exception as exc:
                 result = None
                 error = error or str(exc)
-            self.messages.put(("done", result, stats, error, edits))
+            self.messages.put(("done", result, stats, error, edits, stopped))
         threading.Thread(target=work, name="codex-sync", daemon=True).start()
 
     def poll(self):
         while not self.messages.empty():
             message = self.messages.get()
             if message[0] == "status":
-                self.status.set(message[1])
+                if not self.closing and not (self.cancel_event and self.cancel_event.is_set()):
+                    self.phase = message[1]
                 continue
-            _, result, stats, error, edits = message
+            _, result, stats, error, edits, stopped = message
             self.busy, self.ready = False, True
+            self.cancel_event = None
             if result:
                 self.projects, self.chats, self.selections, self.setup = result
                 if edits:
@@ -391,6 +417,8 @@ class App:
                 self.status.set(summary)
             elif error:
                 self.status.set("Sync could not finish. See Sync details.")
+            elif stopped:
+                self.status.set("Sync stopped. Use Sync now to continue.")
             elif self.edits:
                 self.status.set("Click Apply selections to save your changes to Drive." if self.folder
                                 else "Choose a Drive folder to save these selections.")
@@ -404,6 +432,11 @@ class App:
             if self.closing:
                 self.root.destroy()
                 return
+        if self.busy:
+            minutes, seconds = divmod(int(time.monotonic() - self.started_at), 60)
+            status = f"{self.phase}  ·  {minutes}:{seconds:02d}"
+            if status != self.status.get():
+                self.status.set(status)
         self.root.after(100, self.poll)
 
     def details(self):
@@ -418,7 +451,10 @@ class App:
     def close(self):
         if self.busy:
             self.closing = True
-            self.status.set("Finishing the current check before closing…")
+            if self.cancel_event:
+                self.cancel_event.set()
+            self.phase = "Finishing the current operation before closing…"
+            self.status.set(self.phase)
             self.update_controls()
         else:
             self.root.destroy()

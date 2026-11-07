@@ -98,20 +98,32 @@ def stamp(path):
     return [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino]
 
 
-def hash_file(path):
+def hash_file(path, progress=None):
     with path.open("rb") as f:
-        return hashlib.file_digest(f, "sha256").hexdigest()
+        if progress is None:
+            return hashlib.file_digest(f, "sha256").hexdigest()
+        sha = hashlib.sha256()
+        read = 0
+        for chunk in iter(lambda: f.read(BLOCK), b""):
+            sha.update(chunk)
+            read += len(chunk)
+            progress(read)
+        return sha.hexdigest()
 
 
-def copy_checked(source, target, expected=None, before=None):
+def copy_checked(source, target, expected=None, before=None, progress=None):
     """Write to a sibling first. Never expose an incomplete or unverified file."""
     before = before if before is not None else stamp(source)
     with temporary(target.parent) as tmp:
         sha = hashlib.sha256()
+        copied = 0
         with source.open("rb") as src, tmp.open("wb") as dst:
             for chunk in iter(lambda: src.read(BLOCK), b""):
                 sha.update(chunk)
                 dst.write(chunk)
+                if progress is not None:
+                    copied += len(chunk)
+                    progress(copied, before[0])
         actual = sha.hexdigest()
         if stamp(source) != before:
             raise SyncError(f"Changed while reading {source.name}; will retry.")
@@ -168,16 +180,16 @@ class Exchange:
         sha = checked(sha, SHA)
         return safe_path(self.root, f"objects/{sha[:2]}/{sha}")
 
-    def push(self, path, sha, original_stamp):
+    def push(self, path, sha, original_stamp, progress=None):
         obj = self.object_path(sha)
         if not obj.is_file():
-            copy_checked(path, obj, sha, original_stamp)
+            copy_checked(path, obj, sha, original_stamp, progress)
 
-    def pull(self, sha, dest):
+    def pull(self, sha, dest, progress=None):
         obj = self.object_path(sha)
         if not obj.is_file():
             raise SyncError("A Drive file has not arrived yet; will retry.")
-        copy_checked(obj, dest, sha)
+        copy_checked(obj, dest, sha, progress=progress)
 
     def history(self, key):
         versions = {}
