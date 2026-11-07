@@ -307,7 +307,7 @@ class App:
         elif ident in selected:
             self.edit(ident, None)
         elif ident in self.projects:
-            self.edit(ident, {"kind": "project", **project_info(self.projects[ident]), "files": True})
+            self.edit(ident, {"kind": "project", **project_info(self.projects[ident]), "files": False})
 
     def set_files(self):
         ident = self.tree.focus()[2:]

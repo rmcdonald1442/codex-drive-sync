@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -108,6 +109,40 @@ class SyncTest(unittest.TestCase):
             self.assertIn("Files changed on both computers", result["issues"][0])
             self.assertEqual(target.read_text(), "b")
             self.assertEqual(source.read_text(), "a")
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required to evaluate .gitignore")
+    def test_standalone_gitignore_filters_new_uploads_and_old_downloads(self):
+        runs = self.workspace / "runs"
+        runs.mkdir()
+        (runs / "results.json").write_text("generated")
+        nested = self.workspace / "nested"
+        nested.mkdir()
+        (nested / ".gitignore").write_text("*.json\n!keep.json\n")
+        (nested / "keep.json").write_text("keep me")
+        (nested / "discard.json").write_text("skip me")
+        with patch("engine.codex_open", return_value=True):
+            # The old workspace inventory predates the root ignore rule.
+            self.a.run(self.drive, self.choose())
+            receiver = self.b.workspace_base / f"Demo-{self.pid[-16:]}"
+            receiver.mkdir(parents=True)
+            (receiver / ".gitignore").write_text("runs/\n")
+            result = self.b.run(self.drive)
+            self.assertEqual(result["issues"], [])
+            self.assertTrue((receiver / "nested" / "keep.json").is_file())
+            self.assertFalse((receiver / "nested" / "discard.json").exists())
+            self.assertFalse((receiver / "runs").exists())
+
+            (self.workspace / ".gitignore").write_text("runs/\n")
+            fresh = self.drive.parent / "fresh"
+            fresh.mkdir()
+            result = self.a.run(fresh, self.choose())
+            self.assertEqual(result["issues"], [])
+            key = "w-" + hashlib.sha256(self.pid.encode()).hexdigest()
+            versions, heads, _ = Exchange(fresh).history(key)
+            files = versions[heads[0]]["files"]
+            self.assertEqual(set(files), {"0/.gitignore", "0/nested/.gitignore", "0/nested/keep.json"})
+            self.assertFalse((self.workspace / ".git").exists())
+            self.assertTrue((runs / "results.json").is_file())
 
     def test_stopping_a_workspace_transfer_keeps_chats_and_allows_retry(self):
         ident, _ = make_chat(self.a.home, self.workspace)

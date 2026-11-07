@@ -3,9 +3,12 @@
 import hashlib
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 from compression import zstd
+from contextlib import contextmanager
 from pathlib import Path
 
 from native import (AppServer, NO_WINDOW, Project, RpcError, append_portable, bridge_desktop, catalog, codex_open,
@@ -131,41 +134,64 @@ def workspace_versions(exchange, key, state):
     return versions, heads, merged, True
 
 
-def files_in(root):
-    if linklike(root):
-        raise SyncError(f"Workspace is a link: {root}")
+@contextmanager
+def workspace_git(root):
+    executable = shutil.which("git")
+    command = [executable, "-C", str(root)] if executable else None
+    if (root / ".git").exists():
+        if command is None:
+            raise SyncError(f"Install Git to sync the workspace files in {root.name}.")
+        yield command
+        return
+    if command is None or not root.is_dir():
+        yield None
+        return
+    # An empty index gives Git normal ignore semantics in a standalone folder.
+    with tempfile.TemporaryDirectory(prefix="codex-sync-git-") as directory:
+        git_dir = Path(directory) / "git"
+        run_git(root, command, "init", "--quiet", "--bare", "--template=", str(git_dir))
+        yield [*command, f"--git-dir={git_dir}", f"--work-tree={root}",
+               "-c", f"core.excludesFile={os.devnull}"]
+
+
+def run_git(root, command, *args, paths=None):
+    try:
+        result = subprocess.run(
+            [*command, *args], input=None if paths is None else b"".join(
+                os.fsencode(path) + b"\0" for path in paths
+            ), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
+            creationflags=NO_WINDOW,
+        )
+        if result.returncode == 0 or (args[0] == "check-ignore" and result.returncode == 1):
+            return [os.fsdecode(path) for path in result.stdout.split(b"\0") if path]
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SyncError(f"Git could not read the ignore rules for {root.name}.") from exc
+    raise SyncError(f"Git could not read the ignore rules for {root.name}.")
+
+
+def files_in(root, git):
     if not root.is_dir():
         return
     if (root / ".git").exists():
+        names = set(run_git(root, git, "ls-files", "--cached", "--others", "--exclude-standard", "-z"))
+    else:
+        names = set()
+        for base, dirs, files in os.walk(root, followlinks=False, onerror=lambda error: (_ for _ in ()).throw(error)):
+            dirs[:] = sorted(n for n in dirs if allowed(n) and not linklike(Path(base) / n))
+            if git is None and ".gitignore" in files:
+                raise SyncError(f"Install Git to apply the .gitignore rules in {root.name}.")
+            names.update((Path(base) / name).relative_to(root).as_posix() for name in files if allowed(name))
+        if git and names:
+            names.difference_update(run_git(root, git, "check-ignore", "-z", "--stdin", paths=names))
+    for name in sorted(names):
+        if not allowed(name):
+            continue
         try:
-            git = subprocess.run(["git", "-C", str(root), "ls-files", "--cached", "--others",
-                                  "--exclude-standard", "-z"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                 timeout=20, creationflags=NO_WINDOW, check=True)
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise SyncError(f"Install Git or fix the repository to sync {root.name}.") from exc
-        for name in sorted(set(git.stdout.decode("utf-8").split("\0")) - {""}):
-            if not allowed(name):
-                continue
-            try:
-                p = safe_path(root, name)
-            except SyncError:
-                continue
-            if p.is_file():
-                yield name, p
-        return
-    for base, dirs, names in os.walk(root, followlinks=False, onerror=lambda error: (_ for _ in ()).throw(error)):
-        dirs[:] = sorted(n for n in dirs if allowed(n) and not linklike(Path(base) / n))
-        for name in sorted(names):
-            p = Path(base) / name
-            rel = p.relative_to(root).as_posix()
-            if not allowed(rel) or linklike(p):
-                continue
-            try:
-                safe_path(root, rel)
-            except SyncError:
-                continue
-            if p.is_file():
-                yield rel, p
+            p = safe_path(root, name)
+        except SyncError:
+            continue
+        if p.is_file():
+            yield name, p
 
 
 class Engine:
@@ -473,24 +499,31 @@ class Engine:
         if not isinstance(remote, dict) or len(remote) > FILE_LIMIT:
             raise SyncError("Invalid workspace inventory.")
         cache, local, destinations = {}, {}, {}
+        ignored_remote = set()
         for i, root in enumerate(roots):
             if not root.is_dir() and root.exists():
                 raise SyncError(f"Workspace path is not a folder: {root}")
-            for name, path in files_in(root):
-                rel = f"{i}/{name}"
-                if len(local) >= FILE_LIMIT:
-                    raise SyncError("Workspace exceeds the 100,000 file limit.")
-                scanning = f"Scanning {project.title} · {len(local):,} files checked"
-                progress(scanning)
-                cache[rel] = fingerprint(path, state.get("cache", {}).get(rel),
-                                         lambda count: progress(f"{scanning} · {count / MIB:.0f} MiB read"))
-                local[rel] = cache[rel][1]
-                destinations[rel] = path
+            with workspace_git(root) as git:
+                prefix = f"{i}/"
+                remote_paths = [rel[len(prefix):] for rel in remote if rel.startswith(prefix)]
+                if git and remote_paths:
+                    ignored = run_git(root, git, "check-ignore", "-z", "--stdin", paths=remote_paths)
+                    ignored_remote.update(prefix + path for path in ignored)
+                for name, path in files_in(root, git):
+                    rel = prefix + name
+                    if len(local) >= FILE_LIMIT:
+                        raise SyncError("Workspace exceeds the 100,000 file limit.")
+                    scanning = f"Scanning {project.title} · {len(local):,} files checked"
+                    progress(scanning)
+                    cache[rel] = fingerprint(path, state.get("cache", {}).get(rel),
+                                             lambda count: progress(f"{scanning} · {count / MIB:.0f} MiB read"))
+                    local[rel] = cache[rel][1]
+                    destinations[rel] = path
         merged = dict(remote)
         downloads = {}
         conflicts = []
         seen = set()
-        paths = sorted(local.keys() | remote.keys())
+        paths = sorted((local.keys() | remote.keys()) - ignored_remote)
         progress(f"Comparing {len(paths):,} project files for {project.title}…", force=True)
         for number, rel in enumerate(paths, 1):
             progress(f"Comparing {project.title} · {number:,} of {len(paths):,} files")
