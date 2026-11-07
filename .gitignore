@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.DS_Store
+Thumbs.db
+*.zip
+*.tmp
+
+# Machine settings, Codex data, and the shared Drive folder are never source.
+settings.json
+running.lock
+shares/
+.codex/
+.codex-global-state.json*
+sessions/
+archived_sessions/
+*.sqlite*
+codex-drive-sync.json
+codex-sync-data/
+compressed-backups/
+.env*
