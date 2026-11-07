@@ -13,11 +13,18 @@ from tkinter import filedialog, messagebox, ttk
 if sys.version_info < (3, 14):
     raise SystemExit("Install Python 3.14 or newer with Tk to run Codex Drive Sync.")
 
-from engine import INTERVAL, Engine, SyncCancelled, project_info
-from storage import MARKER, read_json, write_json
+from engine import INTERVAL, Engine, Size, SyncCancelled, project_info
+from storage import MARKER, SyncError, read_json, stamp, write_json
 
 BG, PANEL, INK, MUTED, BLUE = "#111723", "#192233", "#edf3fc", "#a2b1c7", "#69b1ff"
 FONT = "Segoe UI" if os.name == "nt" else "Helvetica Neue"
+
+
+def format_size(size):
+    for unit, factor in (("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)):
+        if size >= factor:
+            return f"{size / factor:,.2f} {unit}"
+    return f"{size:,} B"
 
 
 def user_data():
@@ -61,6 +68,7 @@ class App:
         self.busy = False
         self.closing = False
         self.cancel_event = None
+        self.preview_cancel = None
         self.phase = ""
         self.started_at = 0.0
         self.messages = queue.Queue()
@@ -135,6 +143,8 @@ class App:
         self.files_button = ttk.Checkbutton(row, text="Include project files", variable=self.project_files,
                                            command=self.set_files)
         self.files_button.pack(side="left", padx=(16, 0))
+        self.preview_button = ttk.Button(row, text="Preview size", command=self.preview_size)
+        self.preview_button.pack(side="right")
         self.status_line = ttk.Label(controls, textvariable=self.status, wraplength=690)
         self.status_line.pack(anchor="w", pady=(9, 0))
         self.issue_line = ttk.Label(controls, textvariable=self.notice, foreground="#f2bd79", wraplength=690)
@@ -268,6 +278,10 @@ class App:
                                    and not inherited else "disabled")
         self.project_files.set(bool(is_project and value and value.get("files")))
         self.files_button.configure(state="normal" if idle and is_project and value else "disabled")
+        can_preview = idle and (chat or (is_project and row[2:] in self.projects))
+        can_stop = self.preview_cancel is not None and not self.preview_cancel.is_set() and not self.closing
+        self.preview_button.configure(text="Stop preview" if self.preview_cancel is not None else "Preview size",
+                                      state="normal" if can_preview or can_stop else "disabled")
 
     def edit(self, ident, value):
         if self.selections.get(ident) == value:
@@ -314,6 +328,110 @@ class App:
         value = self.combined().get(ident)
         if value and value["kind"] == "project":
             self.edit(ident, {**value, "files": self.project_files.get()})
+
+    def preview_size(self):
+        if self.preview_cancel is not None:
+            self.preview_cancel.set()
+            self.phase = "Stopping the preview…"
+            self.update_controls()
+            return
+        if self.busy or self.closing:
+            return
+        row = self.tree.focus()
+        ident = row[2:]
+        project = self.projects.get(ident) if row.startswith("p:") else None
+        chat = self.chats.get(ident) if row.startswith("c:") else None
+        if project is None and chat is None:
+            return
+        title = project.title if project else chat.title
+        chats = [c for c in self.chats.values() if c.project == ident] if project else [chat]
+        selected = self.combined()
+        folder, engine = self.folder, self.engine
+        prior_status = self.status.get()
+        cancel = threading.Event()
+        self.preview_cancel = cancel
+        self.busy = True
+        self.phase = "Reading local sizes…"
+        self.started_at = time.monotonic()
+        self.status.set(self.phase)
+        self.update_controls()
+
+        def work():
+            included, unselected = Size(), Size()
+            rows, notes = [], []
+            total = 0
+            incomplete = False
+            try:
+                unavailable = 0
+                for item in chats:
+                    if cancel.is_set():
+                        raise SyncCancelled
+                    try:
+                        size = stamp(item.path)[0]
+                    except (OSError, SyncError):
+                        unavailable += 1
+                        continue
+                    marked = item.id in selected or selected.get(item.project, {}).get("kind") == "project"
+                    (included if marked else unselected).add(size)
+                rows.append(("Chats to sync", included))
+                if unselected.count:
+                    rows.append(("Chats not selected", unselected))
+                total = included.bytes
+                if unavailable:
+                    notes.append(f"Size unavailable for {unavailable:,} local chat files.")
+                    incomplete = True
+
+                if project:
+                    try:
+                        workspace = engine.preview_workspace(project, folder, cancelled=cancel.is_set)
+                    except (OSError, ValueError, SyncError) as exc:
+                        notes.append(f"Workspace size unavailable. {exc}")
+                        incomplete = True
+                    else:
+                        if selected.get(ident, {}).get("files"):
+                            rows.append(("Workspace files to sync", workspace.eligible))
+                            total += workspace.eligible.bytes
+                        else:
+                            rows.append(("Eligible workspace files not selected", workspace.eligible))
+                        ignored = "Ignored workspace files counted" if workspace.partial else "Ignored workspace files"
+                        rows.append((ignored, workspace.ignored))
+                        if workspace.partial:
+                            notes.append("The ignored count is partial because some files could not be scanned.")
+                        if workspace.missing_roots:
+                            notes.append("Some workspace folders are unavailable on this machine.")
+                            incomplete = True
+                else:
+                    notes.append("Chat history is copied as one file. Project ignore rules apply to workspace files.")
+            except SyncCancelled:
+                pass
+            except Exception as exc:
+                notes.append(f"Size preview could not finish. {exc}")
+                incomplete = True
+            self.messages.put(("preview", cancel.is_set(), prior_status, title, total, incomplete, rows, notes))
+
+        threading.Thread(target=work, name="codex-size-preview", daemon=True).start()
+
+    def show_preview(self, title, total, incomplete, rows, notes):
+        window = tk.Toplevel(self.root)
+        window.title("Sync size preview")
+        window.transient(self.root)
+        window.configure(bg=BG)
+        body = ttk.Frame(window, padding=(22, 18))
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=title, style="Accent.TLabel", wraplength=540).grid(row=0, columnspan=3, sticky="w")
+        heading = "Known size to sync" if incomplete else "To be synced"
+        ttk.Label(body, text=f"{heading}  {format_size(total)}", font=(FONT, 17, "bold")).grid(
+            row=1, columnspan=3, sticky="w", pady=(6, 14))
+        body.columnconfigure(0, weight=1)
+        for index, (label, size) in enumerate(rows, 2):
+            ttk.Label(body, text=label).grid(row=index, column=0, sticky="w", pady=3)
+            ttk.Label(body, text=f"{size.count:,}", style="Muted.TLabel").grid(row=index, column=1, sticky="e", padx=16)
+            ttk.Label(body, text=format_size(size.bytes)).grid(row=index, column=2, sticky="e")
+        notes.insert(0, "Local sizes based on your current selections. Drive may already have some of these files.")
+        ttk.Label(body, text="\n\n".join(notes), style="Muted.TLabel", wraplength=540).grid(
+            row=len(rows) + 2, columnspan=3, sticky="w", pady=(16, 12))
+        ttk.Button(body, text="Close", command=window.destroy).grid(row=len(rows) + 3, column=2, sticky="e")
+        window.bind("<Escape>", lambda _: window.destroy())
 
     def choose_drive(self):
         value = filedialog.askdirectory(parent=self.root, title="Choose a dedicated Google Drive folder",
@@ -395,6 +513,18 @@ class App:
                 if not self.closing and not (self.cancel_event and self.cancel_event.is_set()):
                     self.phase = message[1]
                 continue
+            if message[0] == "preview":
+                _, stopped, prior_status, *preview = message
+                self.busy = False
+                self.preview_cancel = None
+                if self.closing:
+                    self.root.destroy()
+                    return
+                self.status.set(prior_status)
+                self.update_controls()
+                if not stopped:
+                    self.show_preview(*preview)
+                continue
             _, result, stats, error, edits, stopped = message
             self.busy, self.ready = False, True
             self.cancel_event = None
@@ -453,6 +583,8 @@ class App:
             self.closing = True
             if self.cancel_event:
                 self.cancel_event.set()
+            if self.preview_cancel:
+                self.preview_cancel.set()
             self.phase = "Finishing the current operation before closing…"
             self.status.set(self.phase)
             self.update_controls()

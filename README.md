@@ -10,6 +10,8 @@ Choose local Codex projects or individual chats, then pick up the same chats on 
 4. Tick the box in the **Sync** column. You can also highlight a row and tick **Sync this project** or **Sync this chat** below the list, or press Space. Projects include existing and future chats. Select **Include project files** to also copy the workspace.
 5. Click **Apply selections**, which becomes available once you've marked something and chosen a Drive folder. The app saves the selection and begins transferring the marked items. Leave the sync app open to check every five minutes; **Sync now** checks immediately after setup.
 
+Highlight a local project or chat and click **Preview size** before applying. The preview shows local counts and sizes for your current selections, eligible files left unselected, and workspace files excluded by the sync rules. The estimate uses file sizes on disk, so it can be larger than the data Drive still needs.
+
 Chats sync first. The first workspace transfer can take several minutes for large projects. The status line shows scanning and transfer progress. Use **Stop sync** to stop the current run and **Sync now** to retry.
 
 ## Add another machine

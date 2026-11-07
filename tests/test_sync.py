@@ -144,6 +144,30 @@ class SyncTest(unittest.TestCase):
             self.assertFalse((self.workspace / ".git").exists())
             self.assertTrue((runs / "results.json").is_file())
 
+    @unittest.skipUnless(shutil.which("git"), "Git is required to evaluate .gitignore")
+    def test_preview_sizes_match_sync_filters_without_reading_file_contents(self):
+        rules = b"runs/\n"
+        (self.workspace / ".gitignore").write_bytes(rules)
+        (self.workspace / "runs").mkdir()
+        (self.workspace / "runs" / "report.json").write_bytes(b"x" * 200)
+        (self.workspace / ".env").write_bytes(b"x" * 50)
+        (self.workspace / "work.py").write_bytes(b"x" * 10)
+        project = catalog(self.a.home)[0][self.pid]
+
+        with patch("engine.hash_file", side_effect=AssertionError("preview must use metadata")):
+            preview = self.a.preview_workspace(project, self.drive)
+        self.assertEqual((preview.eligible.count, preview.eligible.bytes), (2, len(rules) + 10))
+        self.assertEqual((preview.ignored.count, preview.ignored.bytes), (2, 250))
+        self.assertFalse(preview.partial)
+        self.assertEqual(list(self.drive.iterdir()), [])
+        self.assertFalse((self.workspace / ".git").exists())
+
+        result = self.a.run(self.drive, self.choose())
+        self.assertEqual(result["issues"], [])
+        key = "w-" + hashlib.sha256(self.pid.encode()).hexdigest()
+        versions, heads, _ = Exchange(self.drive).history(key)
+        self.assertEqual(set(versions[heads[0]]["files"]), {"0/.gitignore", "0/work.py"})
+
     def test_stopping_a_workspace_transfer_keeps_chats_and_allows_retry(self):
         ident, _ = make_chat(self.a.home, self.workspace)
         content = b"workspace payload" * 100_000

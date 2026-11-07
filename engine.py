@@ -4,11 +4,13 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
 from compression import zstd
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from native import (AppServer, NO_WINDOW, Project, RpcError, append_portable, bridge_desktop, catalog, codex_open,
@@ -27,6 +29,24 @@ MIB = 1024 ** 2
 
 class SyncCancelled(Exception):
     pass
+
+
+@dataclass
+class Size:
+    count: int = 0
+    bytes: int = 0
+
+    def add(self, size):
+        self.count += 1
+        self.bytes += size
+
+
+@dataclass
+class WorkspaceSize:
+    eligible: Size = field(default_factory=Size)
+    ignored: Size = field(default_factory=Size)
+    partial: bool = False
+    missing_roots: int = 0
 
 
 def allowed(relative):
@@ -169,7 +189,7 @@ def run_git(root, command, *args, paths=None):
     raise SyncError(f"Git could not read the ignore rules for {root.name}.")
 
 
-def files_in(root, git):
+def files_in(root, git, check_cancel=lambda: None):
     if not root.is_dir():
         return
     if (root / ".git").exists():
@@ -177,6 +197,7 @@ def files_in(root, git):
     else:
         names = set()
         for base, dirs, files in os.walk(root, followlinks=False, onerror=lambda error: (_ for _ in ()).throw(error)):
+            check_cancel()
             dirs[:] = sorted(n for n in dirs if allowed(n) and not linklike(Path(base) / n))
             if git is None and ".gitignore" in files:
                 raise SyncError(f"Install Git to apply the .gitignore rules in {root.name}.")
@@ -184,6 +205,7 @@ def files_in(root, git):
         if git and names:
             names.difference_update(run_git(root, git, "check-ignore", "-z", "--stdin", paths=names))
     for name in sorted(names):
+        check_cancel()
         if not allowed(name):
             continue
         try:
@@ -217,6 +239,71 @@ class Engine:
                     if chat.project == p.id:
                         chat.project = shared
         return projects, chats, selections, setup
+
+    def workspace_roots(self, project, folder):
+        if any(linklike(Path(r)) for r in project.roots):
+            raise SyncError("A project workspace is a link; choose a regular folder.")
+        roots = tuple(Path(r).resolve() for r in project.roots)
+        for root in roots:
+            overlaps_drive = folder and (folder.is_relative_to(root) or root.is_relative_to(folder))
+            if root == Path(root.anchor) or root == Path.home() or overlaps_drive or (
+                self.home.is_relative_to(root) or root.is_relative_to(self.home)
+            ):
+                raise SyncError("Choose a workspace outside the Codex data and Drive sync folders.")
+            if not root.is_dir() and root.exists():
+                raise SyncError(f"Workspace path is not a folder: {root}")
+        return roots
+
+    def preview_workspace(self, project, folder=None, *, cancelled=lambda: False):
+        """Count local regular files using metadata and the same rules as sync."""
+        result = WorkspaceSize()
+
+        def check_cancel():
+            if cancelled():
+                raise SyncCancelled
+
+        def mark_partial(_error):
+            result.partial = True
+
+        for root in self.workspace_roots(project, folder.resolve() if folder else None):
+            check_cancel()
+            if not root.is_dir():
+                result.missing_roots += 1
+                continue
+            with workspace_git(root) as git:
+                eligible = set()
+                for name, path in files_in(root, git, check_cancel):
+                    if result.eligible.count >= FILE_LIMIT:
+                        raise SyncError(f"The workspace exceeds the {FILE_LIMIT:,} file limit.")
+                    result.eligible.add(path.stat().st_size)
+                    eligible.add(name)
+
+            # Bound the extra walk for large ignored trees such as dependencies or Git data.
+            if result.ignored.count >= FILE_LIMIT:
+                result.partial = True
+                continue
+            for base, dirs, files in os.walk(root, followlinks=False, onerror=mark_partial):
+                check_cancel()
+                directory = Path(base)
+                dirs[:] = [name for name in dirs if not linklike(directory / name)]
+                for name in files:
+                    check_cancel()
+                    path = directory / name
+                    if path.relative_to(root).as_posix() in eligible:
+                        continue
+                    try:
+                        info = path.lstat()
+                    except OSError as exc:
+                        mark_partial(exc)
+                        continue
+                    if stat.S_ISREG(info.st_mode):
+                        result.ignored.add(info.st_size)
+                        if result.ignored.count >= FILE_LIMIT:
+                            break
+                if result.ignored.count >= FILE_LIMIT:
+                    result.partial = True
+                    break
+        return result
 
     def run(self, folder, edits=None, report=lambda message: None, *, cancelled=lambda: False):
         def check_cancel():
@@ -485,14 +572,7 @@ class Engine:
 
     def sync_files(self, exchange, ident, project, state, stats, progress):
         progress(f"Scanning project files for {project.title}…", force=True)
-        if any(linklike(Path(r)) for r in project.roots):
-            raise SyncError("A project workspace is a link; choose a regular folder.")
-        roots = tuple(Path(r).resolve() for r in project.roots)
-        for root in roots:
-            if root == Path(root.anchor) or root == Path.home() or (
-                exchange.folder.is_relative_to(root) or root.is_relative_to(exchange.folder)
-            ) or self.home.is_relative_to(root) or root.is_relative_to(self.home):
-                raise SyncError("Choose a workspace outside the Codex data and Drive sync folders.")
+        roots = self.workspace_roots(project, exchange.folder)
         key = "w-" + hashlib.sha256(ident.encode()).hexdigest()
         versions, heads, remote, join_heads = workspace_versions(exchange, key, state)
         base = versions.get(state.get("revision"), {}).get("files", {})
@@ -501,8 +581,6 @@ class Engine:
         cache, local, destinations = {}, {}, {}
         ignored_remote = set()
         for i, root in enumerate(roots):
-            if not root.is_dir() and root.exists():
-                raise SyncError(f"Workspace path is not a folder: {root}")
             with workspace_git(root) as git:
                 prefix = f"{i}/"
                 remote_paths = [rel[len(prefix):] for rel in remote if rel.startswith(prefix)]
